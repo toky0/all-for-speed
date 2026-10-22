@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Download the free DB-IP Lite city and ASN databases (CC BY 4.0) and swap them in.
+# DB-IP publishes a new file at the start of each month; fall back to last month's.
+set -euo pipefail
+
+DEST=/var/lib/speedtest/geo
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+fetch() { # $1 = city|asn
+  local kind=$1 month url
+  for month in "$(date -u +%Y-%m)" "$(date -u -d "$(date -u +%Y-%m-15) -1 month" +%Y-%m)"; do
+    url="https://download.db-ip.com/free/dbip-${kind}-lite-${month}.mmdb.gz"
+    if curl -fsSL --retry 3 -o "$TMP/$kind.mmdb.gz" "$url"; then
+      gunzip -t "$TMP/$kind.mmdb.gz"
+      gunzip -c "$TMP/$kind.mmdb.gz" > "$TMP/$kind.mmdb"
+      # sanity check: real files are tens of MB and end with MaxMind metadata
+      [[ $(stat -c %s "$TMP/$kind.mmdb") -gt 1000000 ]] || { echo "$kind: file too small"; return 1; }
+      grep -q 'MaxMind.com' <(tail -c 200000 "$TMP/$kind.mmdb") || { echo "$kind: not an mmdb file"; return 1; }
+      install -m 0644 -o speedtest -g speedtest "$TMP/$kind.mmdb" "$DEST/$kind.mmdb.new"
+      mv -f "$DEST/$kind.mmdb.new" "$DEST/$kind.mmdb"
+      echo "$kind: installed $month"
+      return 0
+    fi
+  done
+  echo "$kind: download failed, keeping the current database"
+  return 1
+}
+
+rc=0
+fetch city || rc=1
+fetch asn  || rc=1
+systemctl reload speedtest 2>/dev/null || true
+exit $rc

@@ -1,0 +1,5 @@
+# build output
+/speedtest
+# local GeoIP databases and test data
+*.mmdb
+expected.json

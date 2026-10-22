@@ -1,0 +1,134 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{NAME}}</title>
+<meta name="description" content="Measure download, upload, latency, jitter and loss over IPv4 and IPv6, on HTTP/1.1, HTTP/2 or HTTP/3.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="apple-mobile-web-app-title" content="{{NAME}}">
+<meta name="theme-color" content="#edf1f5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e1826" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1 class="brand">{{NAME}}</h1>
+  <p class="server">Test server: <span id="server-location"></span></p>
+</header>
+
+<main>
+  <section class="stage" aria-labelledby="phase">
+    <div class="gauge" id="gauge">
+      <svg id="dial" viewBox="0 0 400 330" aria-hidden="true"></svg>
+      <div class="dial-center">
+        <p class="dial-mode" id="mode">Ready</p>
+        <p class="dial-value"><span id="value">0</span> <span id="unit">Mbps</span></p>
+        <p class="dial-peak" id="peak">&nbsp;</p>
+      </div>
+      <ul class="protos" id="protos" aria-label="HTTP versions in use">
+        <li data-p="HTTP/1.1" title="HTTP/1.1 over TCP"><i></i>HTTP/1.1</li>
+        <li data-p="HTTP/2.0" title="HTTP/2 over TCP"><i></i>HTTP/2</li>
+        <li data-p="HTTP/3.0" title="HTTP/3 over QUIC (UDP)"><i></i>HTTP/3</li>
+      </ul>
+    </div>
+
+    <div class="side">
+      <p id="phase" role="status">Checking your IPv4 and IPv6 connectivity…</p>
+
+      <div class="trace-wrap">
+        <canvas id="trace" aria-hidden="true"></canvas>
+        <ul class="legend" aria-hidden="true">
+          <li class="lg v4"><i></i>IPv4</li>
+          <li class="lg v6"><i></i>IPv6</li>
+          <li class="lg dl"><i></i>Download</li>
+          <li class="lg ul"><i></i>Upload</li>
+        </ul>
+      </div>
+
+      <div class="controls">
+        <button id="start" class="engine" type="button" disabled aria-label="Start test" data-state="off">
+          <span class="engine-face" aria-hidden="true">
+            <span class="e-top">Engine</span>
+            <span class="e-start">Start</span>
+            <span class="e-stop">Stop</span>
+          </span>
+        </button>
+
+        <div class="options">
+          <fieldset class="proto-pick" id="proto-pick">
+            <legend>HTTP version</legend>
+            <div class="keys">
+              <label class="key" data-p="h1"><input type="radio" name="proto" value="h1" disabled><span class="cap"><i class="lamp" aria-hidden="true"></i>HTTP/1.1</span></label>
+              <label class="key" data-p="h2"><input type="radio" name="proto" value="h2" disabled><span class="cap"><i class="lamp" aria-hidden="true"></i>HTTP/2</span></label>
+              <label class="key" data-p="h3"><input type="radio" name="proto" value="h3" disabled><span class="cap"><i class="lamp" aria-hidden="true"></i>HTTP/3</span></label>
+            </div>
+          </fieldset>
+          <fieldset class="families">
+            <legend>Test over</legend>
+            <div class="switches">
+              <label class="switch" data-fam="v4"><input type="checkbox" role="switch" id="use-v4" checked disabled><span class="track" aria-hidden="true"><span class="on">ON</span><span class="off">OFF</span><span class="knob"></span></span>IPv4</label>
+              <label class="switch" data-fam="v6"><input type="checkbox" role="switch" id="use-v6" checked disabled><span class="track" aria-hidden="true"><span class="on">ON</span><span class="off">OFF</span><span class="knob"></span></span>IPv6</label>
+            </div>
+          </fieldset>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="lanes" aria-label="Results by protocol">
+    <article class="lane" data-fam="v4">
+      <h2>IPv4</h2>
+      <p class="addr" data-k="ip">Detecting…</p>
+      <p class="net" data-k="net"></p>
+      <p class="loc" data-k="loc"></p>
+      <p class="via" data-k="via"></p>
+      <dl class="metrics">
+        <div><dt>Download</dt><dd data-m="down">–</dd></div>
+        <div><dt>Upload</dt><dd data-m="up">–</dd></div>
+        <div><dt>Ping</dt><dd data-m="ping">–</dd></div>
+        <div><dt>Jitter</dt><dd data-m="jitter">–</dd></div>
+        <div><dt>Latency under load</dt><dd data-m="loaded">–</dd></div>
+        <div><dt>Loss</dt><dd data-m="loss">–</dd></div>
+      </dl>
+    </article>
+    <article class="lane" data-fam="v6">
+      <h2>IPv6</h2>
+      <p class="addr" data-k="ip">Detecting…</p>
+      <p class="net" data-k="net"></p>
+      <p class="loc" data-k="loc"></p>
+      <p class="via" data-k="via"></p>
+      <dl class="metrics">
+        <div><dt>Download</dt><dd data-m="down">–</dd></div>
+        <div><dt>Upload</dt><dd data-m="up">–</dd></div>
+        <div><dt>Ping</dt><dd data-m="ping">–</dd></div>
+        <div><dt>Jitter</dt><dd data-m="jitter">–</dd></div>
+        <div><dt>Latency under load</dt><dd data-m="loaded">–</dd></div>
+        <div><dt>Loss</dt><dd data-m="loss">–</dd></div>
+      </dl>
+    </article>
+  </section>
+
+  <details class="about">
+    <summary>How these numbers are measured</summary>
+    <p>The test runs over HTTP/1.1 by default because it is the fastest of the three in a browser. It opens six separate TCP connections, and your computer's operating system handles them very efficiently, so it keeps up on links of several gigabits per second.</p>
+    <p>You can switch to HTTP/2 or HTTP/3 with the keys next to Start. HTTP/2 carries all six transfers over a single TCP connection. HTTP/3 runs over QUIC on UDP, the protocol most large websites now use; because the browser does much of QUIC's work itself, it usually tops out lower on very fast links. If your network blocks UDP, the browser falls back to HTTP/2 and the page tells you. Up to about 1 Gbps the three versions usually give similar results. The lights under the gauge show which version each request actually used, and your choice is remembered for next time.</p>
+    <p>Download and upload use six parallel requests for 10 seconds each. The first 1.5 seconds are left out so connection ramp-up doesn't pull the result down.</p>
+    <p>Ping is the median of 20 small requests on an idle connection. Jitter is the average change between consecutive pings.</p>
+    <p>Latency under load is the server's view of round-trip time while the download is running. A big jump over your idle ping points to oversized buffers along the path (bufferbloat).</p>
+    <p>Loss is measured by the server during the download: lost QUIC packets on HTTP/3, retransmitted TCP segments on HTTP/1.1 and HTTP/2. A web page can't send raw ping or UDP probes, so this is the closest reading of packet loss it can take. Pings that time out are listed next to it.</p>
+  </details>
+</main>
+
+<footer class="foot">
+  <p><a href="https://db-ip.com" rel="noopener">IP Geolocation by DB-IP</a>. Your addresses are looked up on this server and are not sent anywhere else.</p>
+  <p class="powered">Powered by <a href="https://git.marwan.ma/MARWAN/all-for-speed" rel="noopener">all-for-speed</a>, free software under the <a href="https://www.gnu.org/licenses/gpl-3.0.html" rel="noopener">GNU GPL v3</a>.</p>
+</footer>
+</body>
+</html>

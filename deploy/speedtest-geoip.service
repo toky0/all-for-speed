@@ -1,0 +1,8 @@
+[Unit]
+Description=Update DB-IP Lite databases for the speed test
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/speedtest-geoip-update
