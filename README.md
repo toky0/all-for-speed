@@ -32,26 +32,16 @@ v6-h2.speedtest  IN CNAME  v6.speedtest
 
 How each protocol is pinned:
 
-- **HTTP/1.1 names** offer only `http/1.1` in the TLS handshake, so the browser can't
-  pick anything else.
+- **HTTP/1.1 names** offer only `http/1.1` in the TLS handshake, so the browser can't pick anything else.
 - **HTTP/2 names** offer HTTP/2 and never advertise HTTP/3.
-- **HTTP/3 names** send `Alt-Svc: h3=":443"`; the page sends a few light requests
-  (up to 2.5 s) until the browser has moved to QUIC. If UDP is blocked, the browser
-  stays on HTTP/2 and the page says so.
-- Browsers reuse a connection for another hostname when the IP and certificate match.
-  If a request lands on a connection of the wrong protocol this way, the server answers
-  `421 Misdirected Request` and the browser retries on a connection of its own.
+- **HTTP/3 names** send `Alt-Svc: h3=":443"`; the page sends a few light requests (up to 2.5 s) until the browser has moved to QUIC. If UDP is blocked, the browser stays on HTTP/2 and the page says so.
+- Browsers reuse a connection for another hostname when the IP matches and the certificate on that connection covers the new name too. To stop that, each group of names gets its own certificate (see below). If it happens anyway, the server answers `421 Misdirected Request`; Chrome and Firefox then retry on a fresh connection, but Safari doesn't, which is why separate certificates matter.
 
-When the page opens it checks every hostname in the background. A protocol whose names
-don't answer (for example, DNS not added yet) is greyed out. The choice is remembered in
-the browser; `?proto=h1`, `?proto=h2` or `?proto=h3` in the URL selects one directly, and
-`-default-proto` sets the server-wide default.
+When the page opens it checks every hostname in the background. A protocol whose names don't answer (for example, DNS not added yet) is greyed out. The choice is remembered in the browser; `?proto=h1`, `?proto=h2` or `?proto=h3` in the URL selects one directly, and `-default-proto` sets the server-wide default.
 
-The three lights under the gauge show the version each request really used, as
-reported by the server in an `X-Proto` response header.
+The three lights under the gauge show the version each request really used, as reported by the server in an `X-Proto` response header.
 
-To let browsers start on HTTP/3 from the very first request, add HTTPS records
-(type 65) for the HTTP/3 names only:
+To let browsers start on HTTP/3 from the very first request, add HTTPS records (type 65) for the HTTP/3 names only:
 
 ```
 v4.speedtest  IN HTTPS 1 . alpn="h3,h2" ipv4hint=<your IPv4>
@@ -84,7 +74,8 @@ This only raises the cap a program may request; it changes no defaults.
    EMAIL=noc@example.org bash deploy/install.sh
    ```
 
-   This installs Go and certbot, opens TCP 80/443 and UDP 443, builds the binary, creates the `speedtest` user, downloads the GeoIP databases, starts the service, and gets one certificate for all seven names. Names without DNS records yet are left out with a warning; re-run the script after adding them and it expands the certificate. Without `EMAIL`, it stops before the certificate.
+   This installs Go and certbot, opens TCP 80/443 and UDP 443, builds the binary, creates the `speedtest` user, downloads the GeoIP databases, starts the service, and gets the TLS certificates. Names without DNS records yet are left out with a warning; re-run the script after adding them. Without `EMAIL`, it stops before the certificate. 
+   It ends with a list of checks and "Install complete" when everything is in place.
 
 3. Open https://speedtest.example.org.
 
@@ -95,7 +86,26 @@ Settings live in `/etc/speedtest/speedtest.env`; after editing, run `systemctl r
 | `DOMAIN` | main hostname (required) |
 | `NAME` | site name in the page header, browser tab and home-screen icon (default "Speed test") |
 | `LOCATION` | server location shown on the page, e.g. "Rabat, Morocco" (hidden when empty) |
+| `MAX_DOWN` | download speed cap per visitor, e.g. `1G` or `500M` (default `0`, no limit) |
+| `MAX_UP` | upload speed cap per visitor (default `0`, no limit) |
 | `EXTRA_ARGS` | any other flags, e.g. `-default-proto h3` |
+
+### Certificates
+
+Four Let's Encrypt certificates, one per group of names, so a browser never reuses one protocol's connection for another's hostname:
+
+| Certificate | Names |
+|---|---|
+| `speedtest` | the page name |
+| `speedtest-h3` | `v4.` and `v6.` |
+| `speedtest-h2` | `v4-h2.` and `v6-h2.` |
+| `speedtest-h1` | `v4-h1.` and `v6-h1.` |
+
+certbot keeps them in `/etc/letsencrypt/live/<name>/`; its deploy hook copies each to `/etc/speedtest/tls/<name>/`, where the server picks the right one for each hostname and reloads it after renewal. 
+
+## Speed caps
+
+`MAX_DOWN` and `MAX_UP` cap how fast one visitor (one IPv4 address or IPv6 /64) can download or upload, shared across that visitor's parallel connections. Suffixes are decimal bits per second: `500M`, `2.5G`, `800k`. The page tells visitors about the cap, and when both directions are capped, the dial's scale ends just above it. Uploads are slowed by reading them at the capped rate, which makes TCP or QUIC flow control hold the browser back.
 
 ## What runs
 
@@ -112,6 +122,7 @@ Both the certificate and the GeoIP files are picked up automatically when they c
 ## Measurement notes
 
 - **Download / upload:** 6 parallel requests for 10 s each: six TCP connections on HTTP/1.1, six streams on one connection with HTTP/2 or HTTP/3. The first 1.5 s are excluded to skip ramp-up. HTTP/2 and HTTP/3 get large flow-control windows (64 MB / 96 MB per connection) so uploads aren't capped by the defaults.
+- **Upload pacing:** each upload request is sized to last about 1.5 s at the speed measured so far (±20% at random, up to 64 MiB), and the six streams start 120 ms apart. On HTTP/1.1 each stream keeps a second request lined up so its connection never waits for a reply.
 - **Ping / jitter:** median of 20 small requests on a warm connection, using the browser's Resource Timing so JavaScript overhead isn't counted. Jitter is the mean difference between consecutive pings.
 - **Latency under load:** the server's smoothed RTT for the connection (TCP or QUIC), sampled every 100 ms during the download. A large rise over idle ping means bufferbloat on the path.
 - **Loss:** measured per connection during the download. On HTTP/3 it is QUIC's own count of packets declared lost over packets sent. On HTTP/1.1 and HTTP/2 it is TCP retransmitted segments over data segments sent (`TCP_INFO`). Browsers can't send raw UDP or ICMP, so this is the closest reading a web page can take. Ping timeouts are shown alongside.

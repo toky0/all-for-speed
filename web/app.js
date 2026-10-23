@@ -10,7 +10,7 @@ const PINGS = 20;
 const PING_TIMEOUT = 2000;
 const H3_WAIT_MS = 2500;         // how long to wait for the browser to move to HTTP/3
 const MAX_UPLOAD_CHUNK = 64 << 20;
-const SCALE = [0, 10, 50, 100, 250, 500, 1000, 2500, 5000, 10000]; // Mbps, evenly spaced on the dial
+let SCALE = [0, 10, 50, 100, 250, 500, 1000, 2500, 5000, 10000]; // Mbps, evenly spaced on the dial
 
 const fams = {
   v4: { key: 'v4', label: 'IPv4', base: '', ok: false },
@@ -21,7 +21,7 @@ const PROTOS = {                 // page value -> what the server reports in X-P
   h2: { name: 'HTTP/2', x: 'HTTP/2.0' },
   h3: { name: 'HTTP/3', x: 'HTTP/3.0' },
 };
-const cfg = { endpoints: {}, protos: [], def: 'h1' };
+const cfg = { endpoints: {}, protos: [], def: 'h1', limits: { down: 0, up: 0 } };
 const avail = {};                // avail[proto][fam] = /api/info answer, or null
 const info = {};                 // info[fam] = first /api/info answer for the lane
 let proto = 'h1';                // selected HTTP version
@@ -350,11 +350,40 @@ function selectProto(p, remember) {
   if (remember) { try { localStorage.setItem('proto', p); } catch { /* private mode */ } }
 }
 
+// "1 Gbps", "500 Mbps", "2.5 Gbps": no trailing zeros for round limits
+function fmtLimit(bps) {
+  const [v, u] = fmtRate(bps);
+  return `${parseFloat(v)} ${u}`;
+}
+
+function limitText() {
+  const { down, up } = cfg.limits;
+  if (down && up && down === up) return ` This server caps each test at ${fmtLimit(down)} in both directions.`;
+  if (down && up) return ` This server caps each test at ${fmtLimit(down)} down and ${fmtLimit(up)} up.`;
+  if (down) return ` This server caps downloads at ${fmtLimit(down)}.`;
+  if (up) return ` This server caps uploads at ${fmtLimit(up)}.`;
+  return '';
+}
+
+// When both directions are capped, end the dial's scale at the first mark above the
+// cap so the arc uses the whole dial.
+function fitScaleToLimits() {
+  const { down, up } = cfg.limits;
+  if (!down || !up) return;
+  const capMbps = Math.max(down, up) / 1e6;
+  const i = SCALE.findIndex((v) => v >= capMbps);
+  if (i < 0 || i === SCALE.length - 1) return;
+  SCALE = SCALE.slice(0, Math.max(i + 1, 3));
+  $('dial').replaceChildren();
+  buildDial();
+  renderDial();
+}
+
 function readyText() {
   const ok = ['v4', 'v6'].filter((k) => fams[k].ok);
   if (!ok.length) return `Neither IPv4 nor IPv6 answered over ${PROTOS[proto].name}. Pick another HTTP version.`;
   const fam = ok.length === 2 ? 'IPv4, then IPv6' : fams[ok[0]].label;
-  return `Ready. Press Start to test ${fam} over ${PROTOS[proto].name}. It takes about ${ok.length === 2 ? 'a minute' : '30 seconds'}.`;
+  return `Ready. Press Start to test ${fam} over ${PROTOS[proto].name}. It takes about ${ok.length === 2 ? 'a minute' : '30 seconds'}.${limitText()}`;
 }
 
 // ---------------------------------------------------------------- HTTP/3 warm-up
@@ -509,6 +538,15 @@ function uploadBlob(size) {
   return uploadMaster.slice(0, size);
 }
 
+// On HTTP/1.1 each of the six lanes is its own TCP connection, so each keeps a
+// second request lined up behind the one being sent and never sits idle waiting
+// for a reply. (HTTP/2 and HTTP/3 share one connection that other streams keep
+// busy, so they don't need it.) Request sizes adapt to about
+// 1.5 s at the lane's measured speed, with some randomness, and lanes start at
+// staggered times: the short pauses at request boundaries never line up across
+// lanes, which used to make the total dip and rise in waves.
+const UPLOAD_TARGET_S = 1.5;
+
 async function runUpload(f) {
   gaugeMode(`${f.label} upload`, f.key);
   gaugeReset();
@@ -517,37 +555,55 @@ async function runUpload(f) {
   let total = 0;
   let done = false;
   let lastProto = '';
+  const over = () => done || performance.now() >= end;
+  const depth = proto === 'h1' ? 2 : 1;   // requests in flight per lane
 
-  const stream = (s) => new Promise((resolve) => {
-    let size = 1 << 20;
-    const next = () => {
-      if (done || performance.now() >= end) return resolve();
+  const lane = (s) => new Promise((resolve) => {
+    let size = 1 << 20;          // first request; later ones follow the measured speed
+    let inflight = 0;
+    const finish = () => { if (inflight === 0 && over()) resolve(); };
+
+    const send = () => {
+      if (over()) return finish();
+      const mySize = size;
       const x = new XMLHttpRequest();
-      const started = performance.now();
       let sent = 0;
+      let t0 = 0;
+      let followed = false;
       const count = (n) => { if (n > sent) { total += n - sent; sent = n; } };
+      const follow = () => { if (!followed) { followed = true; send(); } };
+      const settle = () => { inflight--; live.delete(x); };
+
+      x.upload.onloadstart = () => { t0 = performance.now(); };
       x.upload.onprogress = (e) => { count(e.loaded); noteProto(lastProto); };
+      x.upload.onload = () => {
+        count(mySize);
+        const secs = (performance.now() - t0) / 1000;
+        if (t0 && secs > 0.05) {
+          const jitter = 0.8 + Math.random() * 0.4;
+          size = Math.round(Math.min(MAX_UPLOAD_CHUNK, Math.max(256 << 10, (mySize / secs) * UPLOAD_TARGET_S * jitter)));
+        }
+        if (inflight < depth) follow(); // body handed to the network: line up the next one now
+      };
       x.onload = () => {
-        live.delete(x);
+        settle();
         lastProto = x.getResponseHeader('X-Proto') || lastProto;
         noteProto(lastProto);
-        if (x.status === 429) return setTimeout(next, 250);
-        count(size);
-        // grow the request until each one takes at least half a second
-        if (performance.now() - started < 500 && size < MAX_UPLOAD_CHUNK) size *= 2;
-        next();
+        if (x.status === 429) { followed = true; setTimeout(send, 250); } else { count(mySize); follow(); }
+        finish();
       };
-      x.onerror = () => { live.delete(x); setTimeout(next, 150); };
-      x.onabort = () => { live.delete(x); resolve(); };
+      x.onerror = () => { settle(); followed = true; setTimeout(send, 150); finish(); };
+      x.onabort = () => { settle(); finish(); };
       x.open('POST', `${f.base}/api/upload?s=${s}&r=${rnd()}`);
+      inflight++;
       live.add(x);
-      x.send(uploadBlob(size));
+      x.send(uploadBlob(mySize));
     };
-    next();
+    setTimeout(send, s * 120);   // stagger the lanes
   });
 
   const m = meter(() => total, f.key, 'ul');
-  const tasks = Array.from({ length: STREAMS }, (_, i) => stream(i));
+  const tasks = Array.from({ length: STREAMS }, (_, i) => lane(i));
   await waitOrStop(PHASE_MS);
   done = true;
   m.stop();
@@ -731,6 +787,8 @@ async function boot() {
     cfg.endpoints = c.endpoints || {};
     cfg.protos = c.protos || [];
     cfg.def = c.default || cfg.protos[0];
+    cfg.limits = { down: c.limits?.down || 0, up: c.limits?.up || 0 };
+    fitScaleToLimits();
     if (c.location) $('server-location').textContent = c.location;
     else document.querySelector('.server').hidden = true; // no location configured
   } catch {

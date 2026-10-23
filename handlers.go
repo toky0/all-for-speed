@@ -51,7 +51,7 @@ type app struct {
 	bufPool sync.Pool
 
 	limMu    sync.Mutex
-	perIP    map[netip.Prefix]int
+	visitors map[netip.Prefix]*visitor
 	inflight int
 
 	resMu   sync.Mutex
@@ -67,12 +67,12 @@ type dlResult struct {
 
 func newApp(cfg config, geo *geoDB) *app {
 	a := &app{
-		cfg:     cfg,
-		geo:     geo,
-		origins: map[string]bool{},
-		junk:    make([]byte, 8<<20),
-		perIP:   map[netip.Prefix]int{},
-		results: map[string]*dlResult{},
+		cfg:      cfg,
+		geo:      geo,
+		origins:  map[string]bool{},
+		junk:     make([]byte, 8<<20),
+		visitors: map[netip.Prefix]*visitor{},
+		results:  map[string]*dlResult{},
 	}
 	if _, err := rand.Read(a.junk); err != nil {
 		panic(err)
@@ -158,8 +158,16 @@ func (a *app) clientIP(r *http.Request) netip.Addr {
 	return ip
 }
 
-// acquire enforces per-client and global limits on concurrent transfers.
-func (a *app) acquire(ip netip.Addr) (func(), bool) {
+// visitor is one IPv4 address or IPv6 /64 with transfers in progress. Its speed
+// caps are shared by all of its parallel streams.
+type visitor struct {
+	streams  int
+	down, up *bucket
+}
+
+// acquire enforces per-visitor and global limits on concurrent transfers and
+// returns the visitor's shared speed caps.
+func (a *app) acquire(ip netip.Addr) (*visitor, func(), bool) {
 	bits := 32
 	if ip.Is6() {
 		bits = 64
@@ -167,16 +175,21 @@ func (a *app) acquire(ip netip.Addr) (func(), bool) {
 	key, _ := ip.Prefix(bits)
 	a.limMu.Lock()
 	defer a.limMu.Unlock()
-	if a.inflight >= globalStreams || a.perIP[key] >= perClientStreams {
-		return nil, false
+	v := a.visitors[key]
+	if a.inflight >= globalStreams || (v != nil && v.streams >= perClientStreams) {
+		return nil, nil, false
+	}
+	if v == nil {
+		v = &visitor{down: newBucket(a.cfg.maxDown), up: newBucket(a.cfg.maxUp)}
+		a.visitors[key] = v
 	}
 	a.inflight++
-	a.perIP[key]++
-	return func() {
+	v.streams++
+	return v, func() {
 		a.limMu.Lock()
 		a.inflight--
-		if a.perIP[key]--; a.perIP[key] <= 0 {
-			delete(a.perIP, key)
+		if v.streams--; v.streams <= 0 {
+			delete(a.visitors, key)
 		}
 		a.limMu.Unlock()
 	}, true
@@ -193,6 +206,7 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"name":      a.cfg.name,
 		"location":  a.cfg.location,
+		"limits":    map[string]int64{"down": a.cfg.maxDown, "up": a.cfg.maxUp},
 		"protos":    a.cfg.protos(),
 		"default":   a.cfg.defProto,
 		"endpoints": a.cfg.endpoints(),
@@ -231,7 +245,7 @@ func (a *app) handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	release, ok := a.acquire(a.clientIP(r))
+	vis, release, ok := a.acquire(a.clientIP(r))
 	if !ok {
 		http.Error(w, "too many concurrent tests", http.StatusTooManyRequests)
 		return
@@ -260,7 +274,7 @@ func (a *app) handleDownload(w http.ResponseWriter, r *http.Request) {
 	last := st0
 	deadline := time.Now().Add(dur)
 	nextSample := time.Now().Add(100 * time.Millisecond)
-	const chunk = 1 << 20
+	chunk := vis.down.chunk(1 << 20)
 	off := 0
 	for {
 		now := time.Now()
@@ -275,6 +289,9 @@ func (a *app) handleDownload(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			nextSample = now.Add(100 * time.Millisecond)
+		}
+		if err := vis.down.wait(r.Context(), chunk); err != nil {
+			break
 		}
 		n, err := w.Write(a.junk[off : off+chunk])
 		sent += int64(n)
@@ -375,7 +392,7 @@ func (a *app) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	release, ok := a.acquire(a.clientIP(r))
+	vis, release, ok := a.acquire(a.clientIP(r))
 	if !ok {
 		http.Error(w, "too many concurrent tests", http.StatusTooManyRequests)
 		return
@@ -383,7 +400,11 @@ func (a *app) handleUpload(w http.ResponseWriter, r *http.Request) {
 	defer release()
 	bp := a.bufPool.Get().(*[]byte)
 	defer a.bufPool.Put(bp)
-	n, err := io.CopyBuffer(io.Discard, http.MaxBytesReader(w, r.Body, maxUploadBytes), *bp)
+	var body io.Reader = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if vis.up != nil {
+		body = &limitedReader{ctx: r.Context(), r: body, b: vis.up, chunk: vis.up.chunk(len(*bp))}
+	}
+	n, err := io.CopyBuffer(io.Discard, body, *bp)
 	var tooBig *http.MaxBytesError
 	if errors.As(err, &tooBig) {
 		http.Error(w, "upload larger than 256 MiB", http.StatusRequestEntityTooLarge)

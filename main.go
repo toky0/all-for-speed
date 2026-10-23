@@ -9,10 +9,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"embed"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"html"
 	"io/fs"
 	"log"
@@ -21,7 +23,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,9 +42,12 @@ type config struct {
 	domain     string
 	name       string
 	location   string
+	maxDown    int64 // bits per second per visitor, 0 = no limit
+	maxUp      int64
 	httpsAddr  string
 	httpAddr   string
 	plainAddr  string
+	certDir    string
 	certFile   string
 	keyFile    string
 	acmeRoot   string
@@ -159,11 +166,14 @@ func main() {
 	flag.StringVar(&cfg.httpsAddr, "https", ":443", "HTTPS listen address, TCP and UDP (empty to disable)")
 	flag.StringVar(&cfg.httpAddr, "http", ":80", "HTTP listen address for ACME challenges and redirects (empty to disable)")
 	flag.StringVar(&cfg.plainAddr, "plain", "", "extra plain-HTTP listener serving the full app, e.g. 127.0.0.1:8080 behind a reverse proxy or for -dev")
-	flag.StringVar(&cfg.certFile, "cert", "/etc/speedtest/tls/fullchain.pem", "TLS certificate chain (reloaded when it changes)")
-	flag.StringVar(&cfg.keyFile, "key", "/etc/speedtest/tls/privkey.pem", "TLS private key")
+	flag.StringVar(&cfg.certDir, "cert-dir", "/etc/speedtest/tls", "directory of certificates: fullchain.pem + privkey.pem in it and in each subdirectory (reloaded when they change)")
+	flag.StringVar(&cfg.certFile, "cert", "", "an extra certificate chain to serve, besides -cert-dir")
+	flag.StringVar(&cfg.keyFile, "key", "", "private key for -cert")
 	flag.StringVar(&cfg.acmeRoot, "acme-webroot", "/var/lib/speedtest/acme", "certbot --webroot directory, served on port 80")
 	flag.StringVar(&cfg.geoCity, "geo-city", "/var/lib/speedtest/geo/city.mmdb", "city database (DB-IP Lite or GeoLite2 City, .mmdb)")
 	flag.StringVar(&cfg.geoASN, "geo-asn", "/var/lib/speedtest/geo/asn.mmdb", "ASN database (DB-IP Lite or GeoLite2 ASN, .mmdb)")
+	maxDown := flag.String("max-down", "0", "download speed cap per visitor, e.g. 1G or 500M (0 = no limit)")
+	maxUp := flag.String("max-up", "0", "upload speed cap per visitor, e.g. 1G or 500M (0 = no limit)")
 	flag.BoolVar(&cfg.h3, "h3", true, "serve HTTP/3 on UDP and advertise it with Alt-Svc")
 	flag.BoolVar(&cfg.h2, "h2", true, "offer HTTP/2 on TCP (otherwise HTTP/1.1 only)")
 	flag.StringVar(&cfg.defProto, "default-proto", "h1", "protocol selected when the page opens: h1, h2 or h3")
@@ -179,6 +189,13 @@ func main() {
 	}
 	if cfg.domain == "" {
 		log.Fatal("-domain is required, e.g. -domain speedtest.example.org")
+	}
+	var err error
+	if cfg.maxDown, err = parseRate(*maxDown); err != nil {
+		log.Fatalf("-max-down: %v", err)
+	}
+	if cfg.maxUp, err = parseRate(*maxUp); err != nil {
+		log.Fatalf("-max-up: %v", err)
 	}
 	if strings.TrimSpace(cfg.name) == "" {
 		cfg.name = "Speed test"
@@ -220,7 +237,10 @@ func main() {
 	var h3srv *http3.Server
 
 	if cfg.httpsAddr != "" {
-		cr := &certReloader{cert: cfg.certFile, key: cfg.keyFile}
+		cr := &certPool{dir: cfg.certDir}
+		if cfg.certFile != "" {
+			cr.extra = append(cr.extra, [2]string{cfg.certFile, cfg.keyFile})
+		}
 
 		srv := newServer(handler)
 		// The HTTP/1.1 hostnames offer only http/1.1 during the TLS handshake.
@@ -345,44 +365,106 @@ func acmeAndRedirect(cfg config) http.Handler {
 	})
 }
 
-// certReloader re-reads the certificate when the files change (certbot renewals),
-// checking at most once a minute. Until a certificate exists, HTTPS handshakes fail
-// but the server keeps running so port 80 can answer the first ACME challenge.
-type certReloader struct {
-	cert, key string
-	mu        sync.Mutex
-	cur       *tls.Certificate
-	mod       time.Time
-	checked   time.Time
+// certPool serves several certificates and picks one per hostname (SNI). Each
+// protocol group has its own certificate on purpose: browsers only reuse a
+// connection for another hostname when the certificate on it covers that name,
+// so separate certificates keep every protocol on connections of its own.
+// Safari, unlike Chrome and Firefox, doesn't retry when the server answers 421.
+//
+// Files are re-read when they change (certbot renewals), checked at most once a
+// minute. Until a certificate exists, handshakes fail but the server keeps running
+// so port 80 can answer the first ACME challenge.
+type certPool struct {
+	dir     string
+	extra   [][2]string // -cert / -key
+	mu      sync.Mutex
+	certs   []poolCert
+	sig     string
+	checked time.Time
 }
 
-func (c *certReloader) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cur != nil && time.Since(c.checked) < time.Minute {
-		return c.cur, nil
-	}
-	c.checked = time.Now()
-	st, err := os.Stat(c.cert)
-	if err != nil {
-		if c.cur != nil {
-			return c.cur, nil
+type poolCert struct {
+	cert  *tls.Certificate
+	leaf  *x509.Certificate
+	names int
+}
+
+func (p *certPool) pairs() [][2]string {
+	var out [][2]string
+	if p.dir != "" {
+		out = append(out, [2]string{filepath.Join(p.dir, "fullchain.pem"), filepath.Join(p.dir, "privkey.pem")})
+		subs, _ := filepath.Glob(filepath.Join(p.dir, "*", "fullchain.pem"))
+		sort.Strings(subs)
+		for _, c := range subs {
+			out = append(out, [2]string{c, filepath.Join(filepath.Dir(c), "privkey.pem")})
 		}
-		return nil, err
 	}
-	if c.cur == nil || !st.ModTime().Equal(c.mod) {
-		kp, err := tls.LoadX509KeyPair(c.cert, c.key)
+	return append(out, p.extra...)
+}
+
+func (p *certPool) reload() {
+	var sig strings.Builder
+	var found [][2]string
+	for _, pr := range p.pairs() {
+		st, err := os.Stat(pr[0])
 		if err != nil {
-			log.Printf("tls: %v", err)
-			if c.cur != nil {
-				return c.cur, nil
-			}
-			return nil, err
+			continue
 		}
-		c.cur, c.mod = &kp, st.ModTime()
-		log.Printf("tls: loaded certificate %s", c.cert)
+		found = append(found, pr)
+		fmt.Fprintf(&sig, "%s@%d;", pr[0], st.ModTime().UnixNano())
 	}
-	return c.cur, nil
+	if sig.String() == p.sig {
+		return
+	}
+	var certs []poolCert
+	for _, pr := range found {
+		kp, err := tls.LoadX509KeyPair(pr[0], pr[1])
+		if err != nil {
+			log.Printf("tls: %s: %v", pr[0], err)
+			continue
+		}
+		leaf, err := x509.ParseCertificate(kp.Certificate[0])
+		if err != nil {
+			log.Printf("tls: %s: %v", pr[0], err)
+			continue
+		}
+		kp.Leaf = leaf
+		certs = append(certs, poolCert{cert: &kp, leaf: leaf, names: len(leaf.DNSNames)})
+		log.Printf("tls: loaded %s for %s", pr[0], strings.Join(leaf.DNSNames, ", "))
+	}
+	if len(certs) == 0 && len(p.certs) > 0 {
+		return // keep serving what we had rather than nothing
+	}
+	p.certs, p.sig = certs, sig.String()
+}
+
+func (p *certPool) get(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	every := time.Minute
+	if len(p.certs) == 0 {
+		every = 5 * time.Second
+	}
+	if time.Since(p.checked) >= every {
+		p.checked = time.Now()
+		p.reload()
+	}
+	if len(p.certs) == 0 {
+		return nil, errors.New("no TLS certificate available yet")
+	}
+	// The certificate covering this name with the fewest other names wins, so the
+	// per-group certificates are preferred over an older all-in-one certificate.
+	var best *poolCert
+	for i := range p.certs {
+		c := &p.certs[i]
+		if hello.ServerName != "" && c.leaf.VerifyHostname(hello.ServerName) == nil && (best == nil || c.names < best.names) {
+			best = c
+		}
+	}
+	if best == nil {
+		best = &p.certs[0]
+	}
+	return best.cert, nil
 }
 
 // render fills the site name into a page template ({{NAME}}).

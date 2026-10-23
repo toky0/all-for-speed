@@ -8,6 +8,8 @@
 #            v4-h2.<DOMAIN> must have only A records, the v6 names only AAAA records
 #   NAME     site name shown on the page (default "Speed test")
 #   LOCATION server location shown on the page, e.g. "Paris, France" (default: none)
+#   MAX_DOWN download speed cap per visitor, e.g. 1G or 500M (default 0 = no limit)
+#   MAX_UP   upload speed cap per visitor (default 0 = no limit)
 #   EMAIL    Let's Encrypt account email; without it the certificate step is skipped
 #   FQ_IFACE interface to give the fq qdisc (default: the IPv4 default-route interface)
 #
@@ -15,7 +17,7 @@
 set -euo pipefail
 
 # On re-runs, settings come from the existing env file unless given again.
-ENV_DOMAIN="" ENV_NAME="" ENV_LOCATION=""
+ENV_DOMAIN="" ENV_NAME="" ENV_LOCATION="" ENV_MAX_DOWN="" ENV_MAX_UP=""
 if [[ -f /etc/speedtest/speedtest.env ]]; then
   while IFS='=' read -r key val; do
     val="${val%\"}"; val="${val#\"}"          # values may or may not be quoted
@@ -23,12 +25,16 @@ if [[ -f /etc/speedtest/speedtest.env ]]; then
       DOMAIN) ENV_DOMAIN="$val" ;;
       NAME)   ENV_NAME="$val" ;;
       LOCATION|LABEL) ENV_LOCATION="$val" ;;   # LABEL: name used by earlier versions
+      MAX_DOWN) ENV_MAX_DOWN="$val" ;;
+      MAX_UP)   ENV_MAX_UP="$val" ;;
     esac
   done < /etc/speedtest/speedtest.env
 fi
 DOMAIN="${DOMAIN:-${ENV_DOMAIN:-}}"
 NAME="${NAME:-${ENV_NAME:-Speed test}}"
 LOCATION="${LOCATION:-${ENV_LOCATION:-}}"
+MAX_DOWN="${MAX_DOWN:-${ENV_MAX_DOWN:-0}}"
+MAX_UP="${MAX_UP:-${ENV_MAX_UP:-0}}"
 [[ -n "$DOMAIN" ]] || { echo "Set DOMAIN, e.g. DOMAIN=speedtest.example.org bash deploy/install.sh"; exit 1; }
 EMAIL="${EMAIL:-}"
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
@@ -61,13 +67,16 @@ install -d -m 0750 -o root -g speedtest /etc/speedtest/tls
 install -d -m 0755 /opt/speedtest
 install -m 0644 README.md /opt/speedtest/README.md 2>/dev/null || true
 
-# Write the settings every run so DOMAIN/NAME/LOCATION given on the command line stick;
+# Write the settings every run so values given on the command line stick;
 # EXTRA_ARGS is kept as it was.
 EXTRA_ARGS_KEEP=$(grep -E '^EXTRA_ARGS=' /etc/speedtest/speedtest.env 2>/dev/null || echo 'EXTRA_ARGS=')
 cat > /etc/speedtest/speedtest.env <<EOF
 DOMAIN=$DOMAIN
 NAME="$NAME"
 LOCATION="$LOCATION"
+# speed caps per visitor, e.g. 1G or 500M; 0 = no limit
+MAX_DOWN=$MAX_DOWN
+MAX_UP=$MAX_UP
 # extra flags, e.g. -default-proto h3 or -h3=false
 $EXTRA_ARGS_KEEP
 EOF
@@ -134,33 +143,53 @@ systemctl restart speedtest
 sleep 1
 systemctl --no-pager --lines=5 status speedtest || true
 
-log "TLS certificate"
-# One certificate for the page and every test hostname. The -h1/-h2 names are added
-# as soon as their DNS records exist; re-run this script after creating them.
+log "TLS certificates"
+# One certificate per group of names. Browsers only reuse a connection for another
+# hostname when its certificate covers that name too, so separate certificates keep
+# each HTTP version on connections of its own. (Safari doesn't retry after a 421.)
 ALL_NAMES=("$DOMAIN" "v4.$DOMAIN" "v6.$DOMAIN" "v4-h2.$DOMAIN" "v6-h2.$DOMAIN" "v4-h1.$DOMAIN" "v6-h1.$DOMAIN")
-NAMES=()
-for n in "${ALL_NAMES[@]}"; do
-  if getent ahosts "$n" >/dev/null; then NAMES+=("$n"); else warn "$n has no DNS record yet; left out of the certificate."; fi
+CERT_NAMES=(speedtest speedtest-h3 speedtest-h2 speedtest-h1)
+declare -A GROUP=(
+  [speedtest]="$DOMAIN"
+  [speedtest-h3]="v4.$DOMAIN v6.$DOMAIN"
+  [speedtest-h2]="v4-h2.$DOMAIN v6-h2.$DOMAIN"
+  [speedtest-h1]="v4-h1.$DOMAIN v6-h1.$DOMAIN"
+)
+sans_of() { # sorted DNS names in a certificate, space separated
+  openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[^, ]*' | sed 's/^DNS://' | sort | tr '\n' ' '
+}
+for cn in "${CERT_NAMES[@]}"; do
+  want=()
+  for n in ${GROUP[$cn]}; do
+    if getent ahosts "$n" >/dev/null; then want+=("$n"); else warn "$n has no DNS record yet; left out of its certificate."; fi
+  done
+  (( ${#want[@]} )) || continue
+  wantset=$(printf '%s\n' "${want[@]}" | sort | tr '\n' ' ')
+  live=/etc/letsencrypt/live/$cn
+  if [[ -s $live/fullchain.pem && "$(sans_of "$live/fullchain.pem")" == "$wantset" ]]; then
+    RENEWED_LINEAGE=$live /usr/local/sbin/speedtest-cert-deploy   # make sure the server has a copy
+    echo "Certificate $cn: ${want[*]}"
+  elif [[ -z "$EMAIL" ]]; then
+    warn "Certificate $cn (${want[*]}) needs to be issued; re-run with EMAIL=you@example.org"
+  else
+    D_ARGS=(); for n in "${want[@]}"; do D_ARGS+=(-d "$n"); done
+    certbot certonly --non-interactive --agree-tos -m "$EMAIL" \
+      --webroot -w /var/lib/speedtest/acme \
+      --cert-name "$cn" --key-type ecdsa \
+      "${D_ARGS[@]}" \
+      --deploy-hook /usr/local/sbin/speedtest-cert-deploy \
+      && echo "Certificate $cn issued: ${want[*]}" \
+      || warn "certbot failed for $cn. Check that ${want[*]} point here and TCP 80 is open."
+  fi
 done
-MISSING=()
+# The all-in-one certificate of earlier versions is retired once every group has its own.
 if [[ -s /etc/speedtest/tls/fullchain.pem ]]; then
-  SANS=$(openssl x509 -in /etc/speedtest/tls/fullchain.pem -noout -ext subjectAltName 2>/dev/null || true)
-  for n in "${NAMES[@]}"; do grep -q "DNS:$n\b" <<<"$SANS" || MISSING+=("$n"); done
-fi
-if [[ -s /etc/speedtest/tls/fullchain.pem && ${#MISSING[@]} -eq 0 ]]; then
-  echo "Certificate covers: ${NAMES[*]}. certbot renews it automatically."
-elif [[ -z "$EMAIL" ]]; then
-  warn "EMAIL not set, skipping. Names still to cover: ${MISSING[*]:-${NAMES[*]}}. Re-run with EMAIL=you@example.org"
-else
-  [[ ${#MISSING[@]} -gt 0 ]] && echo "Adding to the certificate: ${MISSING[*]}"
-  D_ARGS=(); for n in "${NAMES[@]}"; do D_ARGS+=(-d "$n"); done
-  certbot certonly --non-interactive --agree-tos -m "$EMAIL" \
-    --webroot -w /var/lib/speedtest/acme \
-    --cert-name speedtest --key-type ecdsa --expand \
-    "${D_ARGS[@]}" \
-    --deploy-hook /usr/local/sbin/speedtest-cert-deploy \
-    && echo "Certificate installed. The server picks it up within a minute." \
-    || warn "certbot failed. Check that every name above points here and TCP 80 is open."
+  all=1
+  for cn in "${CERT_NAMES[@]}"; do [[ -s /etc/speedtest/tls/$cn/fullchain.pem ]] || all=0; done
+  if (( all )); then
+    rm -f /etc/speedtest/tls/fullchain.pem /etc/speedtest/tls/privkey.pem
+    echo "Removed the old all-in-one certificate copy; each group now has its own."
+  fi
 fi
 systemctl enable --now certbot-renew.timer 2>/dev/null || true
 
@@ -196,18 +225,18 @@ for p in "" -h2 -h1; do
   fi
 done
 
-# Certificate
-if [[ -s /etc/speedtest/tls/fullchain.pem ]]; then
-  SANS=$(openssl x509 -in /etc/speedtest/tls/fullchain.pem -noout -ext subjectAltName 2>/dev/null || true)
-  UNCOVERED=()
-  for n in "${ALL_NAMES[@]}"; do grep -q "DNS:$n\b" <<<"$SANS" || UNCOVERED+=("$n"); done
-  END=$(openssl x509 -in /etc/speedtest/tls/fullchain.pem -noout -enddate 2>/dev/null | cut -d= -f2)
-  if [[ ${#UNCOVERED[@]} -eq 0 ]]; then ok "TLS certificate covers all 7 names, valid until $END"
-  else bad "TLS certificate is missing ${UNCOVERED[*]}; re-run with EMAIL=... once their DNS records exist."
+# Certificates: one per group, each covering exactly its names
+for cn in "${CERT_NAMES[@]}"; do
+  f=/etc/speedtest/tls/$cn/fullchain.pem
+  wantset=$(printf '%s\n' ${GROUP[$cn]} | sort | tr '\n' ' ')
+  if [[ ! -s $f ]]; then
+    bad "No certificate $cn yet for ${GROUP[$cn]}; re-run with EMAIL=you@example.org once their DNS records exist."
+  elif [[ "$(sans_of "$f")" != "$wantset" ]]; then
+    bad "Certificate $cn covers $(sans_of "$f")but should cover exactly ${GROUP[$cn]}; re-run with EMAIL=... to reissue it."
+  else
+    ok "Certificate $cn covers ${GROUP[$cn]}, valid until $(openssl x509 -in "$f" -noout -enddate | cut -d= -f2)"
   fi
-else
-  bad "No TLS certificate yet; re-run with EMAIL=you@example.org once DNS points here."
-fi
+done
 
 # Services and data
 if systemctl is-active --quiet speedtest; then ok "speedtest service is running"
@@ -215,7 +244,7 @@ else bad "speedtest service is not running; see: journalctl -u speedtest -n 50"
 fi
 if curl -fsS -o /dev/null --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/api/ping" 2>/dev/null; then
   ok "https://$DOMAIN answers with a valid certificate"
-elif [[ -s /etc/speedtest/tls/fullchain.pem ]]; then
+elif [[ -s /etc/speedtest/tls/speedtest/fullchain.pem ]]; then
   bad "https://$DOMAIN doesn't answer locally; see: journalctl -u speedtest -n 50"
 fi
 for t in speedtest-geoip.timer certbot-renew.timer; do
