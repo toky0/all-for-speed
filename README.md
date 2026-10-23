@@ -147,9 +147,9 @@ Both the certificate and the GeoIP files are picked up automatically when they c
 
 TLS at 10 Gbps costs roughly one CPU core per direction with AES-NI, and QUIC costs more per byte than TCP. Give the container **4 vCPUs** or more so the server isn't the bottleneck when several visitors test at once.
 
-## Icons
+## Customize the logo
 
-The mark is a teal throughput trace. To use another logo:
+The current logo is a teal throughput trace. To use another logo:
 
 ```bash
 dnf install librsvg2-tools
@@ -176,7 +176,7 @@ Copyright (C) 2026 MARWAN.
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; see [LICENSE](LICENSE).
 
-Third-party parts keep their own licenses:
+Third-party components have their own licenses:
 
 - [quic-go](https://github.com/quic-go/quic-go) (HTTP/3): MIT.
 - IP geolocation by [DB-IP](https://db-ip.com): CC BY 4.0. The databases are downloaded at install time, and the attribution link in the page footer is required by their license.
