@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="web/favicon.svg" width="96" height="96" alt="all-for-speed logo, a teal throughput trace">
+</p>
+
 # all-for-speed
 
 A self-hosted browser speed test. It measures download, upload, ping, jitter, latency under load and
@@ -5,6 +9,12 @@ loss, separately over IPv4 and IPv6, and shows each address with its ASN, city a
 
 One Go binary serves the page, the test endpoints, TLS (HTTP/1.1 and HTTP/2 on TCP 443, HTTP/3 on UDP 443) and the ACME challenges for Let's Encrypt. The only dependency is quic-go for HTTP/3. 
 The ASN, city and country are looked up locally (DB-IP Lite), never sent to a third party.
+
+## Screenshots
+
+| A test running over HTTP/2 | Results over HTTP/3, IPv4 and IPv6 |
+|---|---|
+| ![Gauge measuring IPv4 upload at 80 Mbps over HTTP/2, with the live speed graph, the engine start button, the HTTP version keys and the IPv4/IPv6 switches](screenshot-1.png) | ![Finished test over HTTP/3 showing download, upload, ping, jitter, latency under load and loss for both IPv4 and IPv6, with each address, its network and location](screenshot-2.png) |
 
 ## How dual-stack and protocol testing works
 
