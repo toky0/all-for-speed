@@ -293,7 +293,9 @@ func (a *app) handleDownload(w http.ResponseWriter, r *http.Request) {
 		if err := vis.down.wait(r.Context(), chunk); err != nil {
 			break
 		}
-		n, err := w.Write(a.junk[off : off+chunk])
+		// The body is random bytes served as application/octet-stream with
+		// X-Content-Type-Options: nosniff; nothing from the request reaches it.
+		n, err := w.Write(a.junk[off : off+chunk]) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
 		sent += int64(n)
 		if err != nil {
 			break

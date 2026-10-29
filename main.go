@@ -21,6 +21,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -361,7 +362,13 @@ func acmeAndRedirect(cfg config) http.Handler {
 		if !known[host] {
 			host = cfg.domain
 		}
-		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
+		// Build the target from the path and query only. Copying the raw request
+		// target would let "GET http:@evil.com/" redirect to https://<us>@evil.com/.
+		target := url.URL{Scheme: "https", Host: host, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery}
+		if !strings.HasPrefix(target.Path, "/") {
+			target.Path, target.RawPath = "/", ""
+		}
+		http.Redirect(w, r, target.String(), http.StatusMovedPermanently)
 	})
 }
 
@@ -503,11 +510,11 @@ func staticHandler(cfg config) http.Handler {
 		case "/", "/index.html":
 			h.Set("Cache-Control", "no-cache")
 			h.Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write(page)
+			http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(page))
 		case "/manifest.webmanifest":
 			h.Set("Cache-Control", "no-cache")
 			h.Set("Content-Type", "application/manifest+json")
-			_, _ = w.Write(manifest)
+			http.ServeContent(w, r, "manifest.webmanifest", time.Time{}, bytes.NewReader(manifest))
 		default:
 			h.Set("Cache-Control", "public, max-age=3600")
 			files.ServeHTTP(w, r)
